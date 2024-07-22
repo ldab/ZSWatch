@@ -66,6 +66,11 @@ menu "ZSWatch"
         prompt "Activate the application 'PPT remote'"
         default n
 
+        config APPLICATIONS_USE_BABY_ALARM
+            bool
+        prompt "Activate the application 'Baby alarm'"
+        default n
+
         menu "Configuration"
             menu "Compass"
                 depends on APPLICATIONS_USE_COMPASS
@@ -255,5 +260,6 @@ menu "ZSWatch"
         rsource "src/applications/notification/Kconfig"
         rsource "src/applications/trivia/Kconfig"
         rsource "src/applications/ppt_remote/Kconfig"
+        rsource "src/applications/baby_alarm/Kconfig"
     endmenu
 endmenu
