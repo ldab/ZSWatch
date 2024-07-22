@@ -1,0 +1,3 @@
+module = ZSW_EDGE_IMPULSE
+module-str = ZSW_EDGE_IMPULSE
+source "subsys/logging/Kconfig.template.log_config"
