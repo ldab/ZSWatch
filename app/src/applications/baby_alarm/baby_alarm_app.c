@@ -8,17 +8,23 @@
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
+#include "zephyr/bluetooth/uuid.h"
+#include "zephyr/bluetooth/bluetooth.h"
 
 #include "baby_alarm_app.h"
 #include "baby_alarm_ui.h"
+
 #include "managers/zsw_app_manager.h"
-#include "ble/ble_hid.h"
 #include "ui/utils/zsw_ui_utils.h"
+
 #include <ei_wrapper.h>
 
 #include "sample_data.h"
 
 #define FRAME_ADD_INTERVAL_MS   100
+#define BTHOME_UUID 0xFCD2
+#define TRIGGER_LABEL "awake"
+#define VALUE_THRESHOLD 0.8
 
 LOG_MODULE_REGISTER(baby_alarm_app, CONFIG_ZSW_BABY_ALARM_APP_LOG_LEVEL);
 
@@ -38,6 +44,42 @@ static application_t app = {
 static lv_timer_t *counter_timer = NULL;
 static int64_t start_time;
 static size_t frame_surplus;
+
+static void send_result_bt()
+{
+    // send to gadgetbridge https://www.espruino.com/Gadgetbridge
+    char request[] = "{\"t\":\"info\", \"msg\":\"kid is awake\"} \n";
+    int ret = ble_comm_send(request, strlen(request));
+    if (ret) {
+        LOG_ERR("ble_comm_send() failed: %d", ret);
+    }
+
+    // advertise as BTHome https://bthome.io/format/
+
+    uint8_t bthome_ad[] = {
+        BT_UUID_16_ENCODE(BTHOME_UUID),
+        0x44, // BTHome v2, no encryption, irregular interval
+        0x22, // moving property
+        0x01, // moving
+    };
+
+    struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE,
+                      (CONFIG_BT_DEVICE_APPEARANCE >> 0) & 0xff,
+                      (CONFIG_BT_DEVICE_APPEARANCE >> 8) & 0xff),
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA_BYTES(BT_DATA_UUID16_ALL,
+                      BT_UUID_16_ENCODE(BT_UUID_DIS_VAL)),
+        BT_DATA(BT_DATA_SVC_DATA16, bthome_ad, ARRAY_SIZE(bthome_ad))
+    };
+
+    ret = bt_le_adv_update_data(ad, ARRAY_SIZE(ad), NULL, 0);
+    if (ret) {
+        LOG_ERR("bt_le_adv_update_data() failed: %d", ret);
+    }
+
+    /// @todo kwork delay adv to normal
+}
 
 static void result_ready_cb(int err)
 {
@@ -64,15 +106,19 @@ static void result_ready_cb(int err)
         }
 
         LOG_INF("Value: %.2f\tLabel: %s", value, label);
+
+        if ((strcmp(label, TRIGGER_LABEL) == 0) && (value > VALUE_THRESHOLD)) {
+            send_result_bt();
+        }
     }
 
     if (err) {
-        LOG_INF("Cannot get classification results (err: %d)", err);
+        LOG_ERR("Cannot get classification results (err: %d)", err);
     } else {
         if (ei_wrapper_classifier_has_anomaly()) {
             err = ei_wrapper_get_anomaly(&anomaly);
             if (err) {
-                LOG_INF("Cannot get anomaly (err: %d)", err);
+                LOG_ERR("Cannot get anomaly (err: %d)", err);
             } else {
                 LOG_INF("Anomaly: %.2f", anomaly);
             }
@@ -82,7 +128,7 @@ static void result_ready_cb(int err)
     if (frame_surplus > 0) {
         err = ei_wrapper_start_prediction(0, 1);
         if (err) {
-            LOG_INF("Cannot restart prediction (err: %d)", err);
+            LOG_ERR("Cannot restart prediction (err: %d)", err);
         } else {
             LOG_INF("Prediction restarted...");
         }
@@ -90,30 +136,30 @@ static void result_ready_cb(int err)
         frame_surplus--;
     }
 
-    // send to gadgetbridge https://www.espruino.com/Gadgetbridge
-    char request[] = "{\"t\":\"info\", \"msg\":\"kid is awake\"} \n";
-    ble_comm_send(request, strlen(request));
-
-    /// @todo adv BTHome https://bthome.io/format/
+    bool cancelled;
+    err = ei_wrapper_clear_data(&cancelled);
+    if (err) {
+        LOG_ERR("Cannot clear data (err: %d)", err);
+    }
 }
 
 static int baby_alarm_app_init()
 {
     int err = ei_wrapper_init(result_ready_cb);
 
-    if (err) {
-        LOG_INF("Edge Impulse wrapper failed to initialize (err: %d)",
+    if ((err != -EALREADY) && (err != 0)) {
+        LOG_ERR("Edge Impulse wrapper failed to initialize (err: %d)",
                 err);
         return 0;
     };
 
     if (ARRAY_SIZE(input_data) < ei_wrapper_get_window_size()) {
-        LOG_INF("Not enough input data");
+        LOG_ERR("Not enough input data");
         return 0;
     }
 
     if (ARRAY_SIZE(input_data) % ei_wrapper_get_frame_size() != 0) {
-        LOG_INF("Improper number of input samples");
+        LOG_ERR("Improper number of input samples");
         return 0;
     }
 
@@ -131,15 +177,15 @@ static int baby_alarm_app_init()
     err = ei_wrapper_add_data(&input_data[cnt],
                               ei_wrapper_get_window_size());
     if (err) {
-        LOG_INF("Cannot provide input data (err: %d)", err);
-        LOG_INF("Increase CONFIG_EI_WRAPPER_DATA_BUF_SIZE");
+        LOG_ERR("Cannot provide input data (err: %d)", err);
+        LOG_ERR("Increase CONFIG_EI_WRAPPER_DATA_BUF_SIZE");
         return 0;
     }
     cnt += ei_wrapper_get_window_size();
 
     err = ei_wrapper_start_prediction(0, 0);
     if (err) {
-        LOG_INF("Cannot start prediction (err: %d)", err);
+        LOG_ERR("Cannot start prediction (err: %d)", err);
     } else {
         LOG_INF("Prediction started...");
     }
@@ -156,8 +202,8 @@ static int baby_alarm_app_init()
         err = ei_wrapper_add_data(&input_data[cnt],
                                   ei_wrapper_get_frame_size());
         if (err) {
-            LOG_INF("Cannot provide input data (err: %d)", err);
-            LOG_INF("Increase CONFIG_EI_WRAPPER_DATA_BUF_SIZE");
+            LOG_ERR("Cannot provide input data (err: %d)", err);
+            LOG_ERR("Increase CONFIG_EI_WRAPPER_DATA_BUF_SIZE");
             return 0;
         }
         cnt += ei_wrapper_get_frame_size();
@@ -165,6 +211,7 @@ static int baby_alarm_app_init()
         k_sleep(K_MSEC(FRAME_ADD_INTERVAL_MS));
     }
 
+    cnt = 0;
     return 0;
 }
 
