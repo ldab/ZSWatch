@@ -8,6 +8,6 @@ target_sources(app PRIVATE gadgetbridge/ble_gadgetbridge.c)
 target_sources(app PRIVATE ble_http.c)
 target_sources(app PRIVATE zsw_gatt_sensor_server.c)
 
-if(CONFIG_APPLICATIONS_USE_PPT_REMOTE)
+if(CONFIG_BT_HIDS)
     target_sources(app PRIVATE ble_hid.c)
 endif()

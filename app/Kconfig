@@ -65,6 +65,15 @@ menu "ZSWatch"
             bool
         prompt "Activate the application 'PPT remote'"
         default n
+        select BT_HIDS
+        select BT_CONN_CTX
+        
+        config APPLICATIONS_USE_REMOTE_SHUTTER
+            bool
+        prompt "Activate the application 'Remote shuter'"
+        default y
+        select BT_HIDS
+        select BT_CONN_CTX
 
         menu "Configuration"
             menu "Compass"
@@ -245,16 +254,17 @@ menu "ZSWatch"
         source "subsys/logging/Kconfig.template.log_config"
 
         rsource "src/basic_battery/Kconfig"
+        rsource "src/ble/Kconfig"
         rsource "src/history/Kconfig"
         rsource "src/sensors/Kconfig"
         rsource "src/sensor_fusion/Kconfig"
-        rsource "src/ble/Kconfig"
-        rsource "src/applications/settings/Kconfig"
-        rsource "src/applications/template/Kconfig"
         rsource "src/applications/iaq/Kconfig"
         rsource "src/applications/notification/Kconfig"
-        rsource "src/applications/trivia/Kconfig"
         rsource "src/applications/ppt_remote/Kconfig"
+        rsource "src/applications/remote_shutter/Kconfig"
+        rsource "src/applications/settings/Kconfig"
+        rsource "src/applications/template/Kconfig"
+        rsource "src/applications/trivia/Kconfig"
     endmenu
 
     menu "UI"
