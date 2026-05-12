@@ -68,22 +68,22 @@ static bool recv_state_valid;
 static bool pending_source_scan;
 
 /*
- * mod_src_intent_start: true  → mod_src was called to *start* PA sync
- *                                (don't remove source after callback)
- *                       false → mod_src was called to *stop* PA sync
- *                                (remove source in callback, existing flow)
+ * bass_discovered: tracks whether BASS discovery has completed successfully.
+ * When false and security changes, we retry discovery (some sinks require
+ * encryption before allowing GATT service discovery).
  */
-static bool mod_src_intent_start;
+static bool bass_discovered;
 
 /*
- * pending_sync_after_clear: when the sink's BASS receive state is stale-SYNCED,
- * the BASS server (see bap_scan_delegator.c:927) skips pa_sync_req_cb entirely
- * (it only runs when state != SYNCED). We must first clear the stale state with
- * mod_src(pa_sync=false), then follow up with mod_src(pa_sync=true) in the
- * callback. pending_pa_interval stores the interval for the follow-up call.
+ * pending_add_after_remove: when switching sources on a sink that already has
+ * a BASS receive state, we must first rem_src the old source, then add_src
+ * the new one. These variables store the deferred add_src parameters.
  */
-static bool     pending_sync_after_clear;
-static uint16_t pending_pa_interval;
+static bool         pending_add_after_remove;
+static uint8_t      pending_add_sid;
+static uint16_t     pending_add_pa_interval;
+static uint32_t     pending_add_broadcast_id;
+static bt_addr_le_t pending_add_addr;
 
 /* ─── Forward declarations ───────────────────────────────────────────────── */
 
@@ -113,6 +113,8 @@ static void broadcast_assistant_discover_cb(struct bt_conn *conn, int err,
         restart_scanning_if_needed();
         return;
     }
+
+    bass_discovered = true;
 
     bt_addr_le = bt_conn_get_dst(conn);
     bt_addr_le_to_str(bt_addr_le, addr_str, sizeof(addr_str));
@@ -319,40 +321,6 @@ static void broadcast_assistant_mod_src_cb(struct bt_conn *conn, int err)
 {
     if (err) {
         LOG_ERR("mod_src FAILED (err %d)", err);
-        pending_sync_after_clear = false;
-        return;
-    }
-
-    if (pending_sync_after_clear) {
-        /*
-         * Step 1 (clear stale SYNCED) completed. Now send the real sync request.
-         * The sink's BASS state is now NOT_SYNCED, so pa_sync_req_cb will fire.
-         */
-        struct bt_bap_bass_subgroup subgroup = {0};
-        struct bt_bap_broadcast_assistant_mod_src_param param = {0};
-        int mod_err;
-
-        pending_sync_after_clear = false;
-        subgroup.bis_sync  = BT_BAP_BIS_SYNC_NO_PREF;
-        param.src_id       = recv_state.src_id;
-        param.pa_sync      = true;
-        param.pa_interval  = pending_pa_interval;
-        param.num_subgroups = 1;
-        param.subgroups    = &subgroup;
-        mod_src_intent_start = true;
-
-        LOG_INF("mod_src (pa_sync=false) cleared — now sending pa_sync=true (src_id=%u)",
-                recv_state.src_id);
-        mod_err = bt_bap_broadcast_assistant_mod_src(conn, &param);
-        if (mod_err) {
-            LOG_ERR("  follow-up mod_src failed (err %d)", mod_err);
-        }
-        return;
-    }
-
-    if (mod_src_intent_start) {
-        /* mod_src was used to start PA sync on an existing receive state */
-        LOG_INF("mod_src (pa_sync=true) OK — sink should now PA sync");
         return;
     }
 
@@ -371,6 +339,37 @@ static void broadcast_assistant_rem_src_cb(struct bt_conn *conn, int err)
         recv_state_valid = false;
         memset(&recv_state, 0, sizeof(recv_state));
         ba_source_id = 0;
+    }
+
+    if (pending_add_after_remove) {
+        pending_add_after_remove = false;
+
+        if (err) {
+            LOG_ERR("rem_src failed — cannot add new source");
+            return;
+        }
+
+        /* Now add the new source */
+        struct bt_bap_bass_subgroup subgroup = {0};
+        struct bt_bap_broadcast_assistant_add_src_param param = {0};
+
+        subgroup.bis_sync   = BT_BAP_BIS_SYNC_NO_PREF;
+        bt_addr_le_copy(&param.addr, &pending_add_addr);
+        param.adv_sid       = pending_add_sid;
+        param.pa_interval   = pending_add_pa_interval;
+        param.broadcast_id  = pending_add_broadcast_id;
+        param.pa_sync       = true;
+        param.num_subgroups = 1;
+        param.subgroups     = &subgroup;
+
+        ba_source_broadcast_id = pending_add_broadcast_id;
+
+        LOG_INF("rem_src OK — now adding new source (bid=0x%06x)",
+                pending_add_broadcast_id);
+        int add_err = bt_bap_broadcast_assistant_add_src(conn, &param);
+        if (add_err) {
+            LOG_ERR("  add_src after rem failed (err %d)", add_err);
+        }
     }
 }
 
@@ -406,12 +405,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
     /*
      * Don't force pairing immediately — some sinks (e.g. hearing aids) reject
-     * unsolicited Pairing Requests and disconnect.  Instead, start BASS
-     * discovery right away (service discovery works without encryption).
-     * Security will be elevated automatically when:
-     *   a) the sink sends a Slave Security Request, or
-     *   b) a GATT write requires encryption (Zephyr auto-elevates).
-     * If neither happens, we request security explicitly after discovery.
+     * unsolicited Pairing Requests and disconnect.  Start BASS discovery
+     * directly; security will be elevated automatically when needed.
      */
     struct bt_conn_info info;
 
@@ -442,7 +437,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     /* Clear all sink-related state */
     recv_state_valid         = false;
     pending_source_scan      = false;
-    pending_sync_after_clear = false;
+    pending_add_after_remove = false;
+    bass_discovered          = false;
     memset(&recv_state, 0, sizeof(recv_state));
     ba_source_id = 0;
 
@@ -474,16 +470,24 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
     LOG_INF("Security: level=%d err=%d", level, err);
 
     if (err) {
-        LOG_ERR("Security failed — disconnecting");
-        bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+        LOG_ERR("Security failed (err %d)", err);
         return;
     }
 
     /*
-     * Security is now established.  BASS discovery was already started in the
-     * connected callback (it works without encryption for service discovery).
-     * Nothing else to do here — the discover_cb path continues from there.
+     * If BASS discovery hasn't completed yet, the sink may have required
+     * encryption before allowing service discovery.  Retry now.
      */
+    if (!bass_discovered) {
+        LOG_INF("Security up — retrying BASS discovery");
+        int disc_err = bt_bap_broadcast_assistant_discover(conn);
+        if (disc_err) {
+            LOG_ERR("BASS discover retry failed (err %d)", disc_err);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+        return;
+    }
+
     LOG_INF("Security elevated to level %d", level);
 }
 
@@ -999,6 +1003,16 @@ int connect_to_sink(bt_addr_le_t *bt_addr_le)
 
     int err = bt_conn_le_create(bt_addr_le, BT_CONN_LE_CREATE_CONN,
                                 BT_LE_CONN_PARAM_DEFAULT, &ba_sink_conn);
+
+    /* Retry once after a short delay — the previous connection's conn object
+     * may still be awaiting recycling by the BLE stack. */
+    if (err == -EINVAL) {
+        LOG_WRN("Conn object not yet recycled, retrying in 500 ms...");
+        k_sleep(K_MSEC(500));
+        err = bt_conn_le_create(bt_addr_le, BT_CONN_LE_CREATE_CONN,
+                                BT_LE_CONN_PARAM_DEFAULT, &ba_sink_conn);
+    }
+
     if (err) {
         LOG_ERR("Connection create failed (err %d)", err);
         restart_scanning_if_needed();
@@ -1051,48 +1065,23 @@ int add_source(uint8_t sid, uint16_t pa_interval, uint32_t broadcast_id, bt_addr
 
     if (recv_state_valid) {
         /*
-         * The sink already has a BASS receive state (e.g. from its autonomous
-         * scanning phase or a previous session). The slot is occupied and
-         * add_src would return BT_ATT_ERR_WRITE_REQ_REJECTED (0xFC/252).
-         * Use mod_src to reuse the existing slot.
-         *
-         * CRITICAL: if the stale state shows pa_sync=SYNCED, the BASS server
-         * (bap_scan_delegator.c:927) will skip pa_sync_req_cb entirely — the
-         * sink will only get bis_sync_req_cb but has no actual PA sync object.
-         * Fix: send mod_src(pa_sync=false) first to clear SYNCED, then send
-         * mod_src(pa_sync=true) in the callback (pending_sync_after_clear).
+         * The sink already has a BASS receive state. We cannot add_src (the
+         * slot is occupied → BT_ATT_ERR_WRITE_REQ_REJECTED). Remove the old
+         * source first, then add the new one in the rem_src callback.
          */
-        struct bt_bap_bass_subgroup subgroup = {0};
-        struct bt_bap_broadcast_assistant_mod_src_param param = {0};
         int err;
 
-        subgroup.bis_sync  = BT_BAP_BIS_SYNC_NO_PREF;
-        param.src_id       = recv_state.src_id;
-        param.num_subgroups = 1;
-        param.subgroups    = &subgroup;
+        pending_add_after_remove = true;
+        pending_add_sid          = sid;
+        pending_add_pa_interval  = pa_interval;
+        pending_add_broadcast_id = broadcast_id;
+        bt_addr_le_copy(&pending_add_addr, addr);
 
-        if (recv_state.pa_sync_state == BT_BAP_PA_STATE_SYNCED) {
-            /* Step 1: clear stale SYNCED state first */
-            param.pa_sync     = false;
-            param.pa_interval = BT_BAP_PA_INTERVAL_UNKNOWN;
-            pending_sync_after_clear = true;
-            pending_pa_interval      = pa_interval;
-            mod_src_intent_start     = false;
-            LOG_INF("  → mod_src(pa_sync=false) to clear stale SYNCED state (src_id=%u)",
-                    recv_state.src_id);
-        } else {
-            /* PA not synced — can go straight to pa_sync=true */
-            param.pa_sync      = true;
-            param.pa_interval  = pa_interval;
-            pending_sync_after_clear = false;
-            mod_src_intent_start     = true;
-            LOG_INF("  → mod_src(pa_sync=true) existing src_id=%u (was pa_sync=%u)",
-                    recv_state.src_id, recv_state.pa_sync_state);
-        }
-
-        err = bt_bap_broadcast_assistant_mod_src(ba_sink_conn, &param);
+        LOG_INF("  → rem_src(src_id=%u) then add_src", recv_state.src_id);
+        err = bt_bap_broadcast_assistant_rem_src(ba_sink_conn, recv_state.src_id);
         if (err) {
-            LOG_ERR("  mod_src failed (err %d)", err);
+            LOG_ERR("  rem_src failed (err %d)", err);
+            pending_add_after_remove = false;
             return err;
         }
         return 0;
@@ -1137,7 +1126,6 @@ int remove_source(void)
     param.pa_interval  = BT_BAP_PA_INTERVAL_UNKNOWN;
     param.num_subgroups = 1;
     param.subgroups    = &subgroup;
-    mod_src_intent_start = false; /* this mod_src is for stopping → rem_src follows */
 
     LOG_INF("remove_source: mod_src(pa_sync=false) src_id=%u", ba_source_id);
     err = bt_bap_broadcast_assistant_mod_src(ba_sink_conn, &param);
@@ -1148,14 +1136,39 @@ int remove_source(void)
     return 0;
 }
 
+void broadcast_assistant_stop(void)
+{
+    stop_scanning();
+    pending_add_after_remove = false;
+
+    if (ba_sink_conn) {
+        int err = bt_conn_disconnect(ba_sink_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+
+        if (err && err != -ENOTCONN) {
+            LOG_WRN("Disconnect failed (err %d), forcing cleanup", err);
+        }
+        /* disconnected callback will unref and NULL ba_sink_conn */
+    }
+
+    if (pa_sync) {
+        int err = bt_le_per_adv_sync_delete(pa_sync);
+
+        if (err) {
+            LOG_WRN("PA sync delete failed (err %d)", err);
+        }
+        pa_sync = NULL;
+        pa_syncing = false;
+    }
+}
+
 int broadcast_assistant_init(void)
 {
     ba_sink_conn             = NULL;
     ba_scan_target           = 0;
     recv_state_valid         = false;
     pending_source_scan      = false;
-    pending_sync_after_clear = false;
-    mod_src_intent_start     = false;
+    pending_add_after_remove = false;
+    bass_discovered          = false;
     pa_sync                  = NULL;
     pa_syncing               = false;
     memset(&recv_state, 0, sizeof(recv_state));

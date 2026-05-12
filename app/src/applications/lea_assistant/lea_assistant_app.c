@@ -23,6 +23,7 @@
 #include "zsw_xip_manager.h"
 
 #include "message_handler.h"
+#include "broadcast_assistant.h"
 
 #define COMPLETE_CLOSE_DELAY_MS 5200
 
@@ -206,11 +207,7 @@ static void lea_assistant_app_stop(void)
 
     lea_assistant_ui_remove();
 
-    message_handler(&(struct webusb_message ) {
-        .sub_type = MESSAGE_SUBTYPE_STOP_SCAN
-    }, 0);
-
-    /// @todo disconnect PA sync
+    broadcast_assistant_stop();
 
     _root = NULL;
     source_stage_visible = false;

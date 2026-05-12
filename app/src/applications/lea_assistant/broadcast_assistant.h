@@ -46,6 +46,7 @@ int disconnect_from_sink(bt_addr_le_t *bt_addr_le);
 int add_source(uint8_t sid, uint16_t pa_interval, uint32_t broadcast_id, bt_addr_le_t *addr);
 int remove_source(void);
 int broadcast_assistant_init(void);
+void broadcast_assistant_stop(void);
 int disconnect_unpair_all(void);
 
 #endif /* __BROADCAST_ASSISTANT_H__ */

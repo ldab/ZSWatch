@@ -97,6 +97,7 @@ static struct bt_conn *current_conn;
 static uint32_t max_send_len;
 
 static int pairing_enabled;
+static bool phone_was_connected;
 
 static struct ble_transport_cb ble_transport_callbacks = {
     .data_receive = bt_receive_cb,
@@ -419,21 +420,34 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 
     LOG_INF("Disconnected: %s (reason %u)", addr, reason);
 
-    if (current_conn) {
+    if (current_conn == conn) {
         k_work_cancel_delayable(&conn_interval_slow_work);
         bt_conn_unref(current_conn);
         current_conn = NULL;
+        phone_was_connected = true;
     }
 
     ble_chronos_state(false);
 }
 
+/**
+ * Called when a connection object is recycled after disconnection.
+ * Restarts advertising if no active connection is present.
+ * Errors indicating the controller is busy are silently ignored
+ * to avoid false alarms from concurrent BLE activity (ie Phone + Broadcast assistant).
+ */
 static void ble_recycled(void)
 {
+    if (current_conn || !phone_was_connected) {
+        return;
+    }
+
+    phone_was_connected = false;
+
     int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), ad_nus, ARRAY_SIZE(ad_nus));
-    if (err) {
+    if (err && err != -EALREADY) {
         LOG_ERR("Advertising failed to start (err %d)", err);
-    } else {
+    } else if (err == 0) {
         LOG_DBG("Advertising successfully started");
     }
 }
